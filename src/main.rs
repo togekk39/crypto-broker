@@ -50,6 +50,7 @@ impl TimeRange {
 struct Asset {
     id: String,
     symbol: String,
+    #[serde(default)]
     chain: Chain,
     quantity: f64,
     avg_cost: f64,
@@ -72,6 +73,12 @@ enum Chain {
     Osmosis,
     Juno,
     Injective,
+}
+
+impl Default for Chain {
+    fn default() -> Self {
+        Self::Bitcoin
+    }
 }
 
 impl Chain {
@@ -144,7 +151,9 @@ struct PricePoint {
 /// 存到 IndexedDB 的完整應用狀態。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct PortfolioState {
+    #[serde(default)]
     assets: Vec<Asset>,
+    #[serde(default = "default_quote_sources")]
     quote_sources: Vec<ChainQuoteConfig>,
 }
 
@@ -155,18 +164,22 @@ impl Default for PortfolioState {
                 Asset::new("BTC", Chain::Bitcoin, 0.25, 52000.0, 68000.0),
                 Asset::new("ETH", Chain::Ethereum, 1.5, 2600.0, 3400.0),
             ],
-            quote_sources: Chain::ALL
-                .iter()
-                .map(|chain| ChainQuoteConfig {
-                    chain: *chain,
-                    kind: QuoteSourceKind::Rest,
-                    endpoint_template: "https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT".to_string(),
-                    price_path: "price".to_string(),
-                    ws_subscribe_template: r#"{"method":"SUBSCRIBE","params":["{symbol}usdt@trade"],"id":1}"#.to_string(),
-                })
-                .collect(),
+            quote_sources: default_quote_sources(),
         }
     }
+}
+
+fn default_quote_sources() -> Vec<ChainQuoteConfig> {
+    Chain::ALL
+        .iter()
+        .map(|chain| ChainQuoteConfig {
+            chain: *chain,
+            kind: QuoteSourceKind::Rest,
+            endpoint_template: "https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT".to_string(),
+            price_path: "price".to_string(),
+            ws_subscribe_template: r#"{"method":"SUBSCRIBE","params":["{symbol}usdt@trade"],"id":1}"#.to_string(),
+        })
+        .collect()
 }
 
 impl Asset {
@@ -396,10 +409,20 @@ fn App() -> Element {
                             onclick: move |_| {
                                 let snapshot = state();
                                 spawn(async move {
-                                    match refresh_quotes(snapshot).await {
-                                        Ok(next) => {
-                                            state.set(next.clone());
-                                            save_queue.send(next);
+                                    match refresh_quotes(&snapshot).await {
+                                        Ok(updates) => {
+                                            let mut merged = state();
+                                            for update in updates {
+                                                if let Some(asset) = merged.assets.iter_mut().find(|a| a.id == update.asset_id) {
+                                                    asset.current_price = update.latest_price;
+                                                    asset.history.push(PricePoint {
+                                                        timestamp_ms: update.timestamp_ms,
+                                                        price: update.latest_price,
+                                                    });
+                                                }
+                                            }
+                                            state.set(merged.clone());
+                                            save_queue.send(merged);
                                         }
                                         Err(err) => {
                                             let _ = web_sys::window().and_then(|w| w.alert_with_message(&format!("更新報價失敗: {err}")).ok());
@@ -611,19 +634,29 @@ fn format_float(v: f64) -> String {
     format!("{v:.6}")
 }
 
-async fn refresh_quotes(mut state: PortfolioState) -> Result<PortfolioState, String> {
-    for asset in &mut state.assets {
+#[derive(Clone, Debug)]
+struct QuoteUpdate {
+    asset_id: String,
+    latest_price: f64,
+    timestamp_ms: f64,
+}
+
+async fn refresh_quotes(state: &PortfolioState) -> Result<Vec<QuoteUpdate>, String> {
+    let mut updates = Vec::new();
+
+    for asset in &state.assets {
         let Some(cfg) = state.quote_sources.iter().find(|x| x.chain == asset.chain) else {
             continue;
         };
         let latest = fetch_external_quote(cfg, &asset.symbol).await?;
-        asset.current_price = latest;
-        asset.history.push(PricePoint {
+        updates.push(QuoteUpdate {
+            asset_id: asset.id.clone(),
+            latest_price: latest,
             timestamp_ms: Date::now(),
-            price: latest,
         });
     }
-    Ok(state)
+
+    Ok(updates)
 }
 
 async fn fetch_external_quote(config: &ChainQuoteConfig, symbol: &str) -> Result<f64, String> {
