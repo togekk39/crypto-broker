@@ -167,10 +167,16 @@ fn App() -> Element {
     // 初次載入時，嘗試從 IndexedDB 還原資料。
     use_effect(move || {
         spawn(async move {
-            if let Ok(Some(saved)) = load_state().await {
-                state.set(saved);
-            } else {
-                let _ = save_state(&state()).await;
+            match load_state().await {
+                Ok(Some(saved)) => state.set(saved),
+                Ok(None) => {
+                    let _ = save_state(&state()).await;
+                }
+                Err(err) => {
+                    web_sys::console::error_1(
+                        &JsValue::from_str(&format!("Failed to load state from IndexedDB: {:?}", err)),
+                    );
+                }
             }
             loading.set(false);
         });
