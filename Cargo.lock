@@ -181,6 +181,7 @@ name = "crypto_broker_web"
 version = "0.1.0"
 dependencies = [
  "dioxus",
+ "futures-util",
  "js-sys",
  "serde",
  "serde_json",

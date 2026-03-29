@@ -2,6 +2,7 @@
 //! 所有資料都存在瀏覽器 IndexedDB，不需要後端或資料庫服務。
 
 use dioxus::prelude::*;
+use futures_util::StreamExt;
 use js_sys::{Date, Promise};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::closure::Closure;
@@ -158,6 +159,17 @@ fn App() -> Element {
     let mut selected_range = use_signal(|| TimeRange::D30);
     let mut loading = use_signal(|| true);
 
+    // 儲存工作序列化：所有寫入都經過同一個協程，避免快點擊造成舊快照覆蓋新狀態。
+    let save_queue = use_coroutine(|mut rx: UnboundedReceiver<PortfolioState>| async move {
+        while let Some(next) = rx.next().await {
+            if let Err(err) = save_state(&next).await {
+                web_sys::console::error_1(
+                    &JsValue::from_str(&format!("Failed to save state to IndexedDB: {:?}", err)),
+                );
+            }
+        }
+    });
+
     // 表單欄位採獨立 signal，避免整體重繪成本。
     let mut symbol = use_signal(|| String::new());
     let mut quantity = use_signal(|| "0.0".to_string());
@@ -267,9 +279,7 @@ fn App() -> Element {
                                 avg_cost.set("0.0".to_string());
                                 current_price.set("0.0".to_string());
 
-                                spawn(async move {
-                                    let _ = save_state(&next).await;
-                                });
+                                save_queue.send(next);
                             },
                             "加入持倉"
                         }
