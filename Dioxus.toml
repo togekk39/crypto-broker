@@ -1,0 +1,11 @@
+[application]
+name = "crypto-broker"
+default_platform = "web"
+out_dir = "dist"
+
+[web.app]
+title = "Crypto Broker Portfolio"
+base_path = "/"
+
+[web.watcher]
+watch_path = ["src", "assets", "index.html"]
