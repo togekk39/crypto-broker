@@ -2,13 +2,15 @@
 //! 所有資料都存在瀏覽器 IndexedDB，不需要後端或資料庫服務。
 
 use dioxus::prelude::*;
+use futures_channel::oneshot;
 use futures_util::StreamExt;
+use gloo_net::http::Request;
 use js_sys::{Date, Promise};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{IdbDatabase, IdbOpenDbRequest, IdbRequest, IdbTransactionMode};
+use web_sys::{ErrorEvent, Event, IdbDatabase, IdbOpenDbRequest, IdbRequest, IdbTransactionMode, MessageEvent, WebSocket};
 
 const DB_NAME: &str = "crypto_broker_db";
 const STORE_NAME: &str = "portfolio";
@@ -48,10 +50,88 @@ impl TimeRange {
 struct Asset {
     id: String,
     symbol: String,
+    chain: Chain,
     quantity: f64,
     avg_cost: f64,
     current_price: f64,
     history: Vec<PricePoint>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum Chain {
+    Bitcoin,
+    Ethereum,
+    Bnb,
+    Solana,
+    Polygon,
+    Avalanche,
+    Arbitrum,
+    Optimism,
+    Base,
+    CosmosHub,
+    Osmosis,
+    Juno,
+    Injective,
+}
+
+impl Chain {
+    const ALL: [Self; 13] = [
+        Self::Bitcoin,
+        Self::Ethereum,
+        Self::Bnb,
+        Self::Solana,
+        Self::Polygon,
+        Self::Avalanche,
+        Self::Arbitrum,
+        Self::Optimism,
+        Self::Base,
+        Self::CosmosHub,
+        Self::Osmosis,
+        Self::Juno,
+        Self::Injective,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bitcoin => "Bitcoin",
+            Self::Ethereum => "Ethereum",
+            Self::Bnb => "BNB Chain",
+            Self::Solana => "Solana",
+            Self::Polygon => "Polygon",
+            Self::Avalanche => "Avalanche",
+            Self::Arbitrum => "Arbitrum",
+            Self::Optimism => "Optimism",
+            Self::Base => "Base",
+            Self::CosmosHub => "Cosmos Hub",
+            Self::Osmosis => "Osmosis",
+            Self::Juno => "Juno",
+            Self::Injective => "Injective",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum QuoteSourceKind {
+    Rest,
+    WebSocket,
+}
+
+impl QuoteSourceKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rest => "RESTful API",
+            Self::WebSocket => "WebSocket",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct ChainQuoteConfig {
+    chain: Chain,
+    kind: QuoteSourceKind,
+    endpoint_template: String,
+    price_path: String,
+    ws_subscribe_template: String,
 }
 
 /// 價格時間點，用於區間盈虧計算。
@@ -65,22 +145,33 @@ struct PricePoint {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct PortfolioState {
     assets: Vec<Asset>,
+    quote_sources: Vec<ChainQuoteConfig>,
 }
 
 impl Default for PortfolioState {
     fn default() -> Self {
         Self {
             assets: vec![
-                Asset::new("BTC", 0.25, 52000.0, 68000.0),
-                Asset::new("ETH", 1.5, 2600.0, 3400.0),
+                Asset::new("BTC", Chain::Bitcoin, 0.25, 52000.0, 68000.0),
+                Asset::new("ETH", Chain::Ethereum, 1.5, 2600.0, 3400.0),
             ],
+            quote_sources: Chain::ALL
+                .iter()
+                .map(|chain| ChainQuoteConfig {
+                    chain: *chain,
+                    kind: QuoteSourceKind::Rest,
+                    endpoint_template: "https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT".to_string(),
+                    price_path: "price".to_string(),
+                    ws_subscribe_template: r#"{"method":"SUBSCRIBE","params":["{symbol}usdt@trade"],"id":1}"#.to_string(),
+                })
+                .collect(),
         }
     }
 }
 
 impl Asset {
     /// 建立新資產，會自動補上示範歷史資料（方便第一次開啟就看得到區間切換效果）。
-    fn new(symbol: &str, quantity: f64, avg_cost: f64, current_price: f64) -> Self {
+    fn new(symbol: &str, chain: Chain, quantity: f64, avg_cost: f64, current_price: f64) -> Self {
         let id = format!("{}-{}", symbol, Date::now());
         let mut history = Vec::with_capacity(4);
         let now = Date::now();
@@ -107,6 +198,7 @@ impl Asset {
         Self {
             id,
             symbol: symbol.to_uppercase(),
+            chain,
             quantity,
             avg_cost,
             current_price,
@@ -172,6 +264,7 @@ fn App() -> Element {
 
     // 表單欄位採獨立 signal，避免整體重繪成本。
     let mut symbol = use_signal(|| String::new());
+    let mut chain = use_signal(|| Chain::Bitcoin);
     let mut quantity = use_signal(|| "0.0".to_string());
     let mut avg_cost = use_signal(|| "0.0".to_string());
     let mut current_price = use_signal(|| "0.0".to_string());
@@ -253,8 +346,18 @@ fn App() -> Element {
 
                     section { class: "mt-6 rounded-2xl border border-slate-800 bg-slate-900/60 p-5",
                         h2 { class: "text-xl font-bold", "新增 / 管理持倉" }
-                        div { class: "mt-4 grid gap-3 md:grid-cols-4",
+                        div { class: "mt-4 grid gap-3 md:grid-cols-5",
                             InputBox { label: "幣種", placeholder: "BTC", value: symbol(), oninput: move |v| symbol.set(v) }
+                            SelectBox {
+                                label: "鏈別",
+                                value: chain().label().to_string(),
+                                options: Chain::ALL.iter().map(|c| c.label().to_string()).collect::<Vec<_>>(),
+                                oninput: move |v| {
+                                    if let Some(found) = Chain::ALL.iter().find(|c| c.label() == v) {
+                                        chain.set(*found);
+                                    }
+                                }
+                            }
                             InputBox { label: "數量", placeholder: "0.5", value: quantity(), oninput: move |v| quantity.set(v) }
                             InputBox { label: "均價", placeholder: "52000", value: avg_cost(), oninput: move |v| avg_cost.set(v) }
                             InputBox { label: "現價", placeholder: "68000", value: current_price(), oninput: move |v| current_price.set(v) }
@@ -272,7 +375,7 @@ fn App() -> Element {
                                 }
 
                                 let mut next = state();
-                                next.assets.push(Asset::new(&symbol(), parsed_qty, parsed_avg, parsed_cur));
+                                next.assets.push(Asset::new(&symbol(), chain(), parsed_qty, parsed_avg, parsed_cur));
                                 state.set(next.clone());
                                 symbol.set(String::new());
                                 quantity.set("0.0".to_string());
@@ -285,6 +388,103 @@ fn App() -> Element {
                         }
                     }
 
+                    section { class: "mt-6 rounded-2xl border border-slate-800 bg-slate-900/60 p-5",
+                        h2 { class: "text-xl font-bold", "外部報價來源設定（依鏈分類）" }
+                        p { class: "mt-1 text-sm text-slate-300", "每條鏈可選 RESTful API 或 WebSocket。URL 請用 token placeholder（symbol）當幣種占位符，price path 例如 price 或 data.last。" }
+                        button {
+                            class: "mt-4 rounded-xl bg-emerald-500 px-4 py-2 font-semibold text-slate-950 hover:bg-emerald-400",
+                            onclick: move |_| {
+                                let snapshot = state();
+                                spawn(async move {
+                                    match refresh_quotes(snapshot).await {
+                                        Ok(next) => {
+                                            state.set(next.clone());
+                                            save_queue.send(next);
+                                        }
+                                        Err(err) => {
+                                            let _ = web_sys::window().and_then(|w| w.alert_with_message(&format!("更新報價失敗: {err}")).ok());
+                                        }
+                                    }
+                                });
+                            },
+                            "從外部來源更新報價"
+                        }
+
+                        div { class: "mt-4 space-y-3",
+                            for cfg in state.read().quote_sources.iter() {
+                                div { class: "rounded-xl border border-slate-800 p-3",
+                                    p { class: "font-semibold", "{cfg.chain.label()}" }
+                                    div { class: "mt-2 grid gap-2 md:grid-cols-2",
+                                        SelectBox {
+                                            label: "來源類型",
+                                            value: cfg.kind.label().to_string(),
+                                            options: vec![QuoteSourceKind::Rest.label().to_string(), QuoteSourceKind::WebSocket.label().to_string()],
+                                            oninput: {
+                                                let chain = cfg.chain;
+                                                move |v| {
+                                                    let mut next = state();
+                                                    if let Some(target) = next.quote_sources.iter_mut().find(|x| x.chain == chain) {
+                                                        target.kind = if v == QuoteSourceKind::WebSocket.label() { QuoteSourceKind::WebSocket } else { QuoteSourceKind::Rest };
+                                                    }
+                                                    state.set(next.clone());
+                                                    save_queue.send(next);
+                                                }
+                                            }
+                                        }
+                                        InputBox {
+                                            label: "Endpoint Template",
+                                            placeholder: "https://.../SYMBOL",
+                                            value: cfg.endpoint_template.clone(),
+                                            oninput: {
+                                                let chain = cfg.chain;
+                                                move |v| {
+                                                    let mut next = state();
+                                                    if let Some(target) = next.quote_sources.iter_mut().find(|x| x.chain == chain) {
+                                                        target.endpoint_template = v;
+                                                    }
+                                                    state.set(next.clone());
+                                                    save_queue.send(next);
+                                                }
+                                            }
+                                        }
+                                        InputBox {
+                                            label: "Price JSON Path",
+                                            placeholder: "price",
+                                            value: cfg.price_path.clone(),
+                                            oninput: {
+                                                let chain = cfg.chain;
+                                                move |v| {
+                                                    let mut next = state();
+                                                    if let Some(target) = next.quote_sources.iter_mut().find(|x| x.chain == chain) {
+                                                        target.price_path = v;
+                                                    }
+                                                    state.set(next.clone());
+                                                    save_queue.send(next);
+                                                }
+                                            }
+                                        }
+                                        InputBox {
+                                            label: "WS Subscribe Template",
+                                            placeholder: "JSON 訂閱訊息模板",
+                                            value: cfg.ws_subscribe_template.clone(),
+                                            oninput: {
+                                                let chain = cfg.chain;
+                                                move |v| {
+                                                    let mut next = state();
+                                                    if let Some(target) = next.quote_sources.iter_mut().find(|x| x.chain == chain) {
+                                                        target.ws_subscribe_template = v;
+                                                    }
+                                                    state.set(next.clone());
+                                                    save_queue.send(next);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     section { class: "mt-6 overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/60",
                         h2 { class: "border-b border-slate-800 px-5 py-4 text-xl font-bold", "持倉列表" }
                         div { class: "overflow-x-auto",
@@ -292,6 +492,7 @@ fn App() -> Element {
                                 thead { class: "bg-slate-800/80 text-slate-300",
                                     tr {
                                         th { class: "px-4 py-3 text-left", "幣種" }
+                                        th { class: "px-4 py-3 text-left", "鏈別" }
                                         th { class: "px-4 py-3 text-right", "數量" }
                                         th { class: "px-4 py-3 text-right", "均價" }
                                         th { class: "px-4 py-3 text-right", "現價" }
@@ -303,6 +504,7 @@ fn App() -> Element {
                                     for asset in state.read().assets.iter() {
                                         tr { class: "border-t border-slate-800 hover:bg-slate-800/40",
                                             td { class: "px-4 py-3 font-semibold", "{asset.symbol}" }
+                                            td { class: "px-4 py-3", "{asset.chain.label()}" }
                                             td { class: "px-4 py-3 text-right", "{format_float(asset.quantity)}" }
                                             td { class: "px-4 py-3 text-right", "{format_currency(asset.avg_cost)}" }
                                             td { class: "px-4 py-3 text-right", "{format_currency(asset.current_price)}" }
@@ -371,6 +573,28 @@ fn InputBox(
     }
 }
 
+#[component]
+fn SelectBox(
+    label: &'static str,
+    value: String,
+    options: Vec<String>,
+    oninput: EventHandler<String>,
+) -> Element {
+    rsx! {
+        label { class: "block",
+            span { class: "text-sm text-slate-300", "{label}" }
+            select {
+                class: "mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 outline-none ring-emerald-500 focus:ring-2",
+                value: "{value}",
+                onchange: move |evt| oninput.call(evt.value()),
+                for option in options {
+                    option { value: "{option}", "{option}" }
+                }
+            }
+        }
+    }
+}
+
 fn pnl_class(v: f64) -> &'static str {
     if v >= 0.0 {
         "px-4 py-3 text-right text-emerald-300"
@@ -385,6 +609,98 @@ fn format_currency(value: f64) -> String {
 
 fn format_float(v: f64) -> String {
     format!("{v:.6}")
+}
+
+async fn refresh_quotes(mut state: PortfolioState) -> Result<PortfolioState, String> {
+    for asset in &mut state.assets {
+        let Some(cfg) = state.quote_sources.iter().find(|x| x.chain == asset.chain) else {
+            continue;
+        };
+        let latest = fetch_external_quote(cfg, &asset.symbol).await?;
+        asset.current_price = latest;
+        asset.history.push(PricePoint {
+            timestamp_ms: Date::now(),
+            price: latest,
+        });
+    }
+    Ok(state)
+}
+
+async fn fetch_external_quote(config: &ChainQuoteConfig, symbol: &str) -> Result<f64, String> {
+    let url = config.endpoint_template.replace("{symbol}", symbol);
+    match config.kind {
+        QuoteSourceKind::Rest => {
+            let text = Request::get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("REST request failed for {symbol}: {e}"))?
+                .text()
+                .await
+                .map_err(|e| format!("REST response parse failed for {symbol}: {e}"))?;
+            extract_price(&text, &config.price_path)
+        }
+        QuoteSourceKind::WebSocket => fetch_quote_from_ws(config, &url, symbol).await,
+    }
+}
+
+async fn fetch_quote_from_ws(config: &ChainQuoteConfig, url: &str, symbol: &str) -> Result<f64, String> {
+    let ws = WebSocket::new(url).map_err(|_| format!("WebSocket open failed for {symbol}"))?;
+    let (tx, rx) = oneshot::channel::<Result<String, String>>();
+    let sender = std::rc::Rc::new(std::cell::RefCell::new(Some(tx)));
+
+    let onmessage_sender = sender.clone();
+    let onmessage = Closure::<dyn FnMut(_)>::new(move |evt: MessageEvent| {
+        let payload = evt.data().as_string().unwrap_or_default();
+        if let Some(tx) = onmessage_sender.borrow_mut().take() {
+            let _ = tx.send(Ok(payload));
+        }
+    });
+    ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+    onmessage.forget();
+
+    let onerror_sender = sender.clone();
+    let onerror = Closure::<dyn FnMut(_)>::new(move |_evt: ErrorEvent| {
+        if let Some(tx) = onerror_sender.borrow_mut().take() {
+            let _ = tx.send(Err("WebSocket message error".to_string()));
+        }
+    });
+    ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+    onerror.forget();
+
+    if !config.ws_subscribe_template.trim().is_empty() {
+        let msg = config.ws_subscribe_template.replace("{symbol}", symbol);
+        let subscribe_msg = msg.clone();
+        let ws_cloned = ws.clone();
+        let onopen = Closure::<dyn FnMut(_)>::new(move |_evt: Event| {
+            let _ = ws_cloned.send_with_str(&subscribe_msg);
+        });
+        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+        onopen.forget();
+    }
+
+    let raw = rx.await.map_err(|_| "WebSocket channel canceled".to_string())??;
+    ws.close().ok();
+    extract_price(&raw, &config.price_path)
+}
+
+fn extract_price(text: &str, path: &str) -> Result<f64, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("JSON decode failed: {e}"))?;
+    let mut cursor = &value;
+    for key in path.split('.') {
+        cursor = cursor
+            .get(key)
+            .ok_or_else(|| format!("price path not found: {path}"))?;
+    }
+    if let Some(n) = cursor.as_f64() {
+        return Ok(n);
+    }
+    if let Some(s) = cursor.as_str() {
+        return s
+            .parse::<f64>()
+            .map_err(|e| format!("price parse failed: {e}"));
+    }
+    Err(format!("price path is not number/string: {path}"))
 }
 
 /// 開啟 IndexedDB 並確保 object store 存在。
