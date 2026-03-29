@@ -10,7 +10,21 @@ serde_json = { git = "https://github.com/serde-rs/json.git", branch = "master", 
 wasm-bindgen-futures = { git = "https://github.com/wasm-bindgen/wasm-bindgen.git", branch = "main", package = "wasm-bindgen-futures" }
 wasm-bindgen = { git = "https://github.com/wasm-bindgen/wasm-bindgen.git", branch = "main", package = "wasm-bindgen" }
 js-sys = { git = "https://github.com/wasm-bindgen/wasm-bindgen.git", branch = "main", package = "js-sys" }
-futures-util = { git = "https://github.com/rust-lang/futures-rs.git", branch = "master", package = "futures-util" }
-futures-channel = { git = "https://github.com/rust-lang/futures-rs.git", branch = "master", package = "futures-channel" }
+futures-util = { git = "https://github.com/rust-lang/futures-rs.git", branch = "0.3", package = "futures-util" }
+futures-channel = { git = "https://github.com/rust-lang/futures-rs.git", branch = "0.3", package = "futures-channel" }
 gloo-net = { git = "https://github.com/ranile/gloo.git", branch = "master", package = "gloo-net" }
 web-sys = { git = "https://github.com/wasm-bindgen/wasm-bindgen.git", branch = "main", package = "web-sys", features = ["HtmlInputElement", "console", "Window", "IdbDatabase", "IdbFactory", "IdbOpenDbRequest", "IdbRequest", "IdbObjectStore", "IdbTransaction", "IdbTransactionMode", "IdbVersionChangeEvent", "WebSocket", "MessageEvent", "ErrorEvent", "Event"] }
+
+[patch.crates-io]
+wasm-bindgen = { git = "https://github.com/wasm-bindgen/wasm-bindgen.git", branch = "main" }
+wasm-bindgen-futures = { git = "https://github.com/wasm-bindgen/wasm-bindgen.git", branch = "main" }
+wasm-bindgen-macro = { git = "https://github.com/wasm-bindgen/wasm-bindgen.git", branch = "main" }
+wasm-bindgen-macro-support = { git = "https://github.com/wasm-bindgen/wasm-bindgen.git", branch = "main" }
+wasm-bindgen-shared = { git = "https://github.com/wasm-bindgen/wasm-bindgen.git", branch = "main" }
+js-sys = { git = "https://github.com/wasm-bindgen/wasm-bindgen.git", branch = "main" }
+web-sys = { git = "https://github.com/wasm-bindgen/wasm-bindgen.git", branch = "main" }
+
+serde = { git = "https://github.com/serde-rs/serde.git", branch = "master" }
+serde_core = { git = "https://github.com/serde-rs/serde.git", branch = "master" }
+serde_derive = { git = "https://github.com/serde-rs/serde.git", branch = "master" }
+serde_json = { git = "https://github.com/serde-rs/json.git", branch = "master" }

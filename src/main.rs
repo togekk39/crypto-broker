@@ -3,7 +3,6 @@
 
 use dioxus::prelude::*;
 use futures_channel::oneshot;
-use futures_util::StreamExt;
 use gloo_net::http::Request;
 use js_sys::{Date, Promise};
 use serde::{Deserialize, Serialize};
@@ -266,7 +265,7 @@ fn App() -> Element {
 
     // 儲存工作序列化：所有寫入都經過同一個協程，避免快點擊造成舊快照覆蓋新狀態。
     let save_queue = use_coroutine(|mut rx: UnboundedReceiver<PortfolioState>| async move {
-        while let Some(next) = rx.next().await {
+        while let Ok(next) = rx.recv().await {
             if let Err(err) = save_state(&next).await {
                 web_sys::console::error_1(
                     &JsValue::from_str(&format!("Failed to save state to IndexedDB: {:?}", err)),
