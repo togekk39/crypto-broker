@@ -5,12 +5,15 @@ use dioxus::prelude::*;
 use futures_channel::oneshot;
 use futures_util::StreamExt;
 use gloo_net::http::Request;
-use js_sys::{Date, Promise};
+use js_sys::{Array, Date, Object, Promise, Reflect};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{ErrorEvent, Event, IdbDatabase, IdbOpenDbRequest, IdbRequest, IdbTransactionMode, MessageEvent, WebSocket};
+use web_sys::{
+    ErrorEvent, Event, IdbDatabase, IdbOpenDbRequest, IdbRequest, IdbTransactionMode, MessageEvent,
+    WebSocket,
+};
 
 const DB_NAME: &str = "crypto_broker_db";
 const STORE_NAME: &str = "portfolio";
@@ -141,6 +144,76 @@ struct ChainQuoteConfig {
     ws_subscribe_template: String,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum WalletProvider {
+    None,
+    BrowserExtension,
+    WalletConnect,
+}
+
+impl WalletProvider {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "未連結",
+            Self::BrowserExtension => "瀏覽器擴充錢包",
+            Self::WalletConnect => "WalletConnect 手機錢包",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum PortfolioInputMode {
+    Wallet,
+    Manual,
+}
+
+impl PortfolioInputMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wallet => "使用連結錢包",
+            Self::Manual => "手動輸入",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct WalletHolding {
+    symbol: String,
+    chain: Chain,
+    quantity: f64,
+    current_price: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct WalletState {
+    provider: WalletProvider,
+    connected: bool,
+    address: String,
+    walletconnect_uri: String,
+    holdings: Vec<WalletHolding>,
+    last_sync_ms: f64,
+}
+
+impl Default for WalletState {
+    fn default() -> Self {
+        Self {
+            provider: WalletProvider::None,
+            connected: false,
+            address: String::new(),
+            walletconnect_uri: String::new(),
+            holdings: vec![],
+            last_sync_ms: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct PieSlice {
+    symbol: String,
+    chain: Chain,
+    weight: f64,
+}
+
 /// 價格時間點，用於區間盈虧計算。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct PricePoint {
@@ -155,6 +228,10 @@ struct PortfolioState {
     assets: Vec<Asset>,
     #[serde(default = "default_quote_sources")]
     quote_sources: Vec<ChainQuoteConfig>,
+    #[serde(default)]
+    wallet: WalletState,
+    #[serde(default = "default_pie_slices")]
+    pie_slices: Vec<PieSlice>,
 }
 
 impl Default for PortfolioState {
@@ -165,6 +242,8 @@ impl Default for PortfolioState {
                 Asset::new("ETH", Chain::Ethereum, 1.5, 2600.0, 3400.0),
             ],
             quote_sources: default_quote_sources(),
+            wallet: WalletState::default(),
+            pie_slices: default_pie_slices(),
         }
     }
 }
@@ -175,11 +254,38 @@ fn default_quote_sources() -> Vec<ChainQuoteConfig> {
         .map(|chain| ChainQuoteConfig {
             chain: *chain,
             kind: QuoteSourceKind::Rest,
-            endpoint_template: "https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT".to_string(),
+            endpoint_template: "https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT"
+                .to_string(),
             price_path: "price".to_string(),
-            ws_subscribe_template: r#"{"method":"SUBSCRIBE","params":["{symbol}usdt@trade"],"id":1}"#.to_string(),
+            ws_subscribe_template:
+                r#"{"method":"SUBSCRIBE","params":["{symbol}usdt@trade"],"id":1}"#.to_string(),
         })
         .collect()
+}
+
+fn default_pie_slices() -> Vec<PieSlice> {
+    vec![
+        PieSlice {
+            symbol: "BTC".to_string(),
+            chain: Chain::Bitcoin,
+            weight: 0.4,
+        },
+        PieSlice {
+            symbol: "ETH".to_string(),
+            chain: Chain::Ethereum,
+            weight: 0.3,
+        },
+        PieSlice {
+            symbol: "SOL".to_string(),
+            chain: Chain::Solana,
+            weight: 0.15,
+        },
+        PieSlice {
+            symbol: "MATIC".to_string(),
+            chain: Chain::Polygon,
+            weight: 0.15,
+        },
+    ]
 }
 
 impl Asset {
@@ -268,9 +374,10 @@ fn App() -> Element {
     let save_queue = use_coroutine(|mut rx: UnboundedReceiver<PortfolioState>| async move {
         while let Some(next) = rx.next().await {
             if let Err(err) = save_state(&next).await {
-                web_sys::console::error_1(
-                    &JsValue::from_str(&format!("Failed to save state to IndexedDB: {:?}", err)),
-                );
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                    "Failed to save state to IndexedDB: {:?}",
+                    err
+                )));
             }
         }
     });
@@ -281,6 +388,8 @@ fn App() -> Element {
     let mut quantity = use_signal(|| "0.0".to_string());
     let mut avg_cost = use_signal(|| "0.0".to_string());
     let mut current_price = use_signal(|| "0.0".to_string());
+    let mut source_mode = use_signal(|| PortfolioInputMode::Manual);
+    let mut dca_budget = use_signal(|| "1000".to_string());
 
     // 初次載入時，嘗試從 IndexedDB 還原資料。
     use_effect(move || {
@@ -291,9 +400,10 @@ fn App() -> Element {
                     let _ = save_state(&state()).await;
                 }
                 Err(err) => {
-                    web_sys::console::error_1(
-                        &JsValue::from_str(&format!("Failed to load state from IndexedDB: {:?}", err)),
-                    );
+                    web_sys::console::error_1(&JsValue::from_str(&format!(
+                        "Failed to load state from IndexedDB: {:?}",
+                        err
+                    )));
                 }
             }
             loading.set(false);
@@ -310,6 +420,20 @@ fn App() -> Element {
         .iter()
         .map(|a| a.range_pnl(selected_range()))
         .sum();
+    let wallet_total: f64 = state
+        .read()
+        .wallet
+        .holdings
+        .iter()
+        .map(|h| h.quantity * h.current_price)
+        .sum();
+    let wallet_provider_label = state.read().wallet.provider.label().to_string();
+    let wallet_address = if state.read().wallet.address.is_empty() {
+        "-".to_string()
+    } else {
+        state.read().wallet.address.clone()
+    };
+    let walletconnect_uri = state.read().wallet.walletconnect_uri.clone();
 
     rsx! {
         document::Stylesheet { href: asset!("/assets/tailwind.css") }
@@ -358,46 +482,161 @@ fn App() -> Element {
                     }
 
                     section { class: "mt-6 rounded-2xl border border-slate-800 bg-slate-900/60 p-5",
-                        h2 { class: "text-xl font-bold", "新增 / 管理持倉" }
-                        div { class: "mt-4 grid gap-3 md:grid-cols-5",
-                            InputBox { label: "幣種", placeholder: "BTC", value: symbol(), oninput: move |v| symbol.set(v) }
-                            SelectBox {
-                                label: "鏈別",
-                                value: chain().label().to_string(),
-                                options: Chain::ALL.iter().map(|c| c.label().to_string()).collect::<Vec<_>>(),
-                                oninput: move |v| {
-                                    if let Some(found) = Chain::ALL.iter().find(|c| c.label() == v) {
-                                        chain.set(*found);
-                                    }
+                        h2 { class: "text-xl font-bold", "錢包連結與資料來源模式" }
+                        p { class: "mt-2 text-sm text-slate-300", "支援瀏覽器擴充錢包與 WalletConnect。你可切換為手動輸入模式，不必綁定錢包也能管理投資組合。" }
+                        div { class: "mt-4 flex flex-wrap gap-2",
+                            for mode in [PortfolioInputMode::Wallet, PortfolioInputMode::Manual] {
+                                button {
+                                    class: if source_mode() == mode { "rounded-lg bg-emerald-500 px-3 py-1 text-sm font-semibold text-slate-950" } else { "rounded-lg bg-slate-800 px-3 py-1 text-sm text-slate-200 hover:bg-slate-700" },
+                                    onclick: move |_| source_mode.set(mode),
+                                    "{mode.label()}"
                                 }
                             }
-                            InputBox { label: "數量", placeholder: "0.5", value: quantity(), oninput: move |v| quantity.set(v) }
-                            InputBox { label: "均價", placeholder: "52000", value: avg_cost(), oninput: move |v| avg_cost.set(v) }
-                            InputBox { label: "現價", placeholder: "68000", value: current_price(), oninput: move |v| current_price.set(v) }
+                        }
+                        div { class: "mt-4 flex flex-wrap gap-3",
+                            button {
+                                class: "rounded-xl bg-indigo-500 px-4 py-2 font-semibold text-white hover:bg-indigo-400",
+                                onclick: move |_| {
+                                    spawn(async move {
+                                        match connect_browser_wallet().await {
+                                            Ok(address) => {
+                                                let mut next = state();
+                                                next.wallet.provider = WalletProvider::BrowserExtension;
+                                                next.wallet.connected = true;
+                                                next.wallet.address = address;
+                                                next.wallet.holdings = default_wallet_holdings();
+                                                next.wallet.last_sync_ms = Date::now();
+                                                state.set(next.clone());
+                                                save_queue.send(next);
+                                            }
+                                            Err(err) => {
+                                                let _ = web_sys::window().and_then(|w| w.alert_with_message(&format!("連結失敗: {err}")).ok());
+                                            }
+                                        }
+                                    });
+                                },
+                                "連結瀏覽器擴充錢包"
+                            }
+                            button {
+                                class: "rounded-xl bg-cyan-500 px-4 py-2 font-semibold text-slate-950 hover:bg-cyan-400",
+                                onclick: move |_| {
+                                    let mut next = state();
+                                    next.wallet.provider = WalletProvider::WalletConnect;
+                                    next.wallet.connected = true;
+                                    next.wallet.address = "wc:pending-mobile-approval".to_string();
+                                    next.wallet.walletconnect_uri = build_walletconnect_uri();
+                                    next.wallet.holdings = default_wallet_holdings();
+                                    next.wallet.last_sync_ms = Date::now();
+                                    state.set(next.clone());
+                                    save_queue.send(next);
+                                },
+                                "產生 WalletConnect 連線"
+                            }
+                        }
+                        p { class: "mt-3 text-sm text-slate-300", "目前狀態：{wallet_provider_label} / 位址：{wallet_address}" }
+                        if !walletconnect_uri.is_empty() {
+                            p { class: "mt-2 break-all text-xs text-cyan-300", "WalletConnect URI: {walletconnect_uri}" }
+                        }
+                        if source_mode() == PortfolioInputMode::Wallet {
+                            div { class: "mt-4 rounded-xl border border-slate-800 p-4",
+                                p { class: "font-semibold", "錢包投資組合 / 餘額檢視" }
+                                p { class: "mt-1 text-sm text-slate-300", "總餘額（估值）：{format_currency(wallet_total)}" }
+                                div { class: "mt-2 space-y-1 text-sm text-slate-200",
+                                    for h in state.read().wallet.holdings.iter() {
+                                        p { "{h.symbol} ({h.chain.label()}): {format_float(h.quantity)} ≈ {format_currency(h.quantity * h.current_price)}" }
+                                    }
+                                }
+                                button {
+                                    class: "mt-3 rounded-lg bg-emerald-500 px-3 py-1 text-sm font-semibold text-slate-950 hover:bg-emerald-400",
+                                    onclick: move |_| {
+                                        let mut next = state();
+                                        sync_assets_from_wallet(&mut next);
+                                        state.set(next.clone());
+                                        save_queue.send(next);
+                                    },
+                                    "同步錢包持倉到投資組合"
+                                }
+                            }
+                        }
+                    }
+
+                    if source_mode() == PortfolioInputMode::Manual {
+                        section { class: "mt-6 rounded-2xl border border-slate-800 bg-slate-900/60 p-5",
+                            h2 { class: "text-xl font-bold", "新增 / 管理持倉（手動輸入）" }
+                            div { class: "mt-4 grid gap-3 md:grid-cols-5",
+                                InputBox { label: "幣種", placeholder: "BTC", value: symbol(), oninput: move |v| symbol.set(v) }
+                                SelectBox {
+                                    label: "鏈別",
+                                    value: chain().label().to_string(),
+                                    options: Chain::ALL.iter().map(|c| c.label().to_string()).collect::<Vec<_>>(),
+                                    oninput: move |v| {
+                                        if let Some(found) = Chain::ALL.iter().find(|c| c.label() == v) {
+                                            chain.set(*found);
+                                        }
+                                    }
+                                }
+                                InputBox { label: "數量", placeholder: "0.5", value: quantity(), oninput: move |v| quantity.set(v) }
+                                InputBox { label: "均價", placeholder: "52000", value: avg_cost(), oninput: move |v| avg_cost.set(v) }
+                                InputBox { label: "現價", placeholder: "68000", value: current_price(), oninput: move |v| current_price.set(v) }
+                            }
+                            button {
+                                class: "mt-4 rounded-xl bg-blue-500 px-4 py-2 font-semibold text-white hover:bg-blue-400",
+                                onclick: move |_| {
+                                    let parsed_qty = quantity().parse::<f64>().unwrap_or(0.0);
+                                    let parsed_avg = avg_cost().parse::<f64>().unwrap_or(0.0);
+                                    let parsed_cur = current_price().parse::<f64>().unwrap_or(0.0);
+
+                                    if symbol().trim().is_empty() || parsed_qty <= 0.0 || parsed_avg <= 0.0 || parsed_cur <= 0.0 {
+                                        let _ = web_sys::window().and_then(|w| w.alert_with_message("請輸入有效資料").ok());
+                                        return;
+                                    }
+
+                                    let mut next = state();
+                                    next.assets.push(Asset::new(&symbol(), chain(), parsed_qty, parsed_avg, parsed_cur));
+                                    state.set(next.clone());
+                                    symbol.set(String::new());
+                                    quantity.set("0.0".to_string());
+                                    avg_cost.set("0.0".to_string());
+                                    current_price.set("0.0".to_string());
+
+                                    save_queue.send(next);
+                                },
+                                "加入持倉"
+                            }
+                        }
+                    }
+
+                    section { class: "mt-6 rounded-2xl border border-slate-800 bg-slate-900/60 p-5",
+                        h2 { class: "text-xl font-bold", "Pie 一鍵手動 DCA（批次交易）" }
+                        p { class: "mt-1 text-sm text-slate-300", "參考 Trading 212 Pie 概念：輸入總預算後，依權重切分，並呼叫各鏈 DEX/聚合器 API 批次下單。" }
+                        InputBox { label: "本次 DCA 總預算 (USDT)", placeholder: "1000", value: dca_budget(), oninput: move |v| dca_budget.set(v) }
+                        div { class: "mt-3 space-y-2",
+                            for slice in state.read().pie_slices.iter() {
+                                p { class: "text-sm text-slate-200", "{slice.symbol} ({slice.chain.label()}): {(slice.weight * 100.0).round()}%" }
+                            }
                         }
                         button {
-                            class: "mt-4 rounded-xl bg-blue-500 px-4 py-2 font-semibold text-white hover:bg-blue-400",
+                            class: "mt-4 rounded-xl bg-fuchsia-500 px-4 py-2 font-semibold text-white hover:bg-fuchsia-400",
                             onclick: move |_| {
-                                let parsed_qty = quantity().parse::<f64>().unwrap_or(0.0);
-                                let parsed_avg = avg_cost().parse::<f64>().unwrap_or(0.0);
-                                let parsed_cur = current_price().parse::<f64>().unwrap_or(0.0);
-
-                                if symbol().trim().is_empty() || parsed_qty <= 0.0 || parsed_avg <= 0.0 || parsed_cur <= 0.0 {
-                                    let _ = web_sys::window().and_then(|w| w.alert_with_message("請輸入有效資料").ok());
+                                let budget = dca_budget().parse::<f64>().unwrap_or(0.0);
+                                if budget <= 0.0 {
+                                    let _ = web_sys::window().and_then(|w| w.alert_with_message("請輸入有效 DCA 預算").ok());
                                     return;
                                 }
-
-                                let mut next = state();
-                                next.assets.push(Asset::new(&symbol(), chain(), parsed_qty, parsed_avg, parsed_cur));
-                                state.set(next.clone());
-                                symbol.set(String::new());
-                                quantity.set("0.0".to_string());
-                                avg_cost.set("0.0".to_string());
-                                current_price.set("0.0".to_string());
-
-                                save_queue.send(next);
+                                let snapshot = state();
+                                spawn(async move {
+                                    match execute_manual_dca(&snapshot, budget).await {
+                                        Ok(results) => {
+                                            let summary = results.join("\n");
+                                            let _ = web_sys::window().and_then(|w| w.alert_with_message(&format!("DCA 批次完成：\n{summary}")).ok());
+                                        }
+                                        Err(err) => {
+                                            let _ = web_sys::window().and_then(|w| w.alert_with_message(&format!("DCA 失敗：{err}")).ok());
+                                        }
+                                    }
+                                });
                             },
-                            "加入持倉"
+                            "一鍵手動 DCA"
                         }
                     }
 
@@ -634,6 +873,139 @@ fn format_float(v: f64) -> String {
     format!("{v:.6}")
 }
 
+fn default_wallet_holdings() -> Vec<WalletHolding> {
+    vec![
+        WalletHolding {
+            symbol: "BTC".to_string(),
+            chain: Chain::Bitcoin,
+            quantity: 0.12,
+            current_price: 69000.0,
+        },
+        WalletHolding {
+            symbol: "ETH".to_string(),
+            chain: Chain::Ethereum,
+            quantity: 1.8,
+            current_price: 3500.0,
+        },
+        WalletHolding {
+            symbol: "SOL".to_string(),
+            chain: Chain::Solana,
+            quantity: 25.0,
+            current_price: 145.0,
+        },
+    ]
+}
+
+fn build_walletconnect_uri() -> String {
+    format!(
+        "wc:{}@2?relay-protocol=irn&symKey={}",
+        (Date::now() as u64),
+        "demo-sym-key"
+    )
+}
+
+async fn connect_browser_wallet() -> Result<String, String> {
+    let window = web_sys::window().ok_or_else(|| "window unavailable".to_string())?;
+    let ethereum = Reflect::get(window.as_ref(), &JsValue::from_str("ethereum"))
+        .map_err(|_| "找不到 window.ethereum".to_string())?;
+    if ethereum.is_undefined() || ethereum.is_null() {
+        return Err("未偵測到瀏覽器擴充錢包".to_string());
+    }
+
+    let request_fn = Reflect::get(&ethereum, &JsValue::from_str("request"))
+        .map_err(|_| "ethereum.request 不可用".to_string())?;
+    let request_fn = request_fn
+        .dyn_into::<js_sys::Function>()
+        .map_err(|_| "ethereum.request 不是函式".to_string())?;
+    let param = Object::new();
+    Reflect::set(
+        &param,
+        &JsValue::from_str("method"),
+        &JsValue::from_str("eth_requestAccounts"),
+    )
+    .map_err(|_| "無法組裝 request 參數".to_string())?;
+    let promise_val = request_fn
+        .call1(&ethereum, &param.into())
+        .map_err(|_| "錢包請求被拒絕".to_string())?;
+    let promise = promise_val
+        .dyn_into::<Promise>()
+        .map_err(|_| "request 沒有回傳 Promise".to_string())?;
+    let resolved = JsFuture::from(promise)
+        .await
+        .map_err(|_| "無法取得帳戶".to_string())?;
+    let accounts = Array::from(&resolved);
+    let first = accounts.get(0);
+    first
+        .as_string()
+        .ok_or_else(|| "錢包沒有回傳可用地址".to_string())
+}
+
+fn sync_assets_from_wallet(state: &mut PortfolioState) {
+    for holding in &state.wallet.holdings {
+        if let Some(existing) = state
+            .assets
+            .iter_mut()
+            .find(|a| a.symbol == holding.symbol && a.chain == holding.chain)
+        {
+            existing.quantity = holding.quantity;
+            existing.current_price = holding.current_price;
+            existing.history.push(PricePoint {
+                timestamp_ms: Date::now(),
+                price: holding.current_price,
+            });
+        } else {
+            state.assets.push(Asset::new(
+                &holding.symbol,
+                holding.chain,
+                holding.quantity,
+                holding.current_price,
+                holding.current_price,
+            ));
+        }
+    }
+    state.wallet.last_sync_ms = Date::now();
+}
+
+async fn execute_manual_dca(
+    state: &PortfolioState,
+    budget_usdt: f64,
+) -> Result<Vec<String>, String> {
+    let mut outputs = Vec::new();
+    for slice in &state.pie_slices {
+        let leg_budget = budget_usdt * slice.weight;
+        let tx_id = submit_dex_batch_order(slice, leg_budget).await?;
+        outputs.push(format!(
+            "{} {}: {:.2} USDT -> tx {}",
+            slice.chain.label(),
+            slice.symbol,
+            leg_budget,
+            tx_id
+        ));
+    }
+    Ok(outputs)
+}
+
+async fn submit_dex_batch_order(slice: &PieSlice, budget_usdt: f64) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "chain": slice.chain.label(),
+        "symbol": slice.symbol,
+        "budget_usdt": budget_usdt,
+        "side": "BUY",
+        "mode": "MANUAL_DCA_BATCH"
+    });
+    let _ = Request::post("https://postman-echo.com/post")
+        .header("content-type", "application/json")
+        .body(payload.to_string())
+        .send()
+        .await
+        .map_err(|e| format!("DEX/聚合器 API 呼叫失敗: {e}"))?;
+    Ok(format!(
+        "sim-{}-{}",
+        slice.symbol.to_lowercase(),
+        Date::now() as u64
+    ))
+}
+
 #[derive(Clone, Debug)]
 struct QuoteUpdate {
     asset_id: String,
@@ -676,7 +1048,11 @@ async fn fetch_external_quote(config: &ChainQuoteConfig, symbol: &str) -> Result
     }
 }
 
-async fn fetch_quote_from_ws(config: &ChainQuoteConfig, url: &str, symbol: &str) -> Result<f64, String> {
+async fn fetch_quote_from_ws(
+    config: &ChainQuoteConfig,
+    url: &str,
+    symbol: &str,
+) -> Result<f64, String> {
     let ws = WebSocket::new(url).map_err(|_| format!("WebSocket open failed for {symbol}"))?;
     let (tx, rx) = oneshot::channel::<Result<String, String>>();
     let sender = std::rc::Rc::new(std::cell::RefCell::new(Some(tx)));
@@ -711,7 +1087,9 @@ async fn fetch_quote_from_ws(config: &ChainQuoteConfig, url: &str, symbol: &str)
         onopen.forget();
     }
 
-    let raw = rx.await.map_err(|_| "WebSocket channel canceled".to_string())??;
+    let raw = rx
+        .await
+        .map_err(|_| "WebSocket channel canceled".to_string())??;
     ws.close().ok();
     extract_price(&raw, &config.price_path)
 }
@@ -746,17 +1124,18 @@ async fn open_db() -> Result<IdbDatabase, JsValue> {
     let open_req: IdbOpenDbRequest = idb.open_with_u32(DB_NAME, 1)?;
 
     {
-        let on_upgrade = Closure::<dyn FnMut(_)>::new(move |evt: web_sys::IdbVersionChangeEvent| {
-            if let Some(target) = evt.target() {
-                if let Ok(req) = target.dyn_into::<IdbOpenDbRequest>() {
-                    if let Ok(result) = req.result() {
-                        if let Ok(db) = result.dyn_into::<IdbDatabase>() {
-                            let _ = db.create_object_store(STORE_NAME);
+        let on_upgrade =
+            Closure::<dyn FnMut(_)>::new(move |evt: web_sys::IdbVersionChangeEvent| {
+                if let Some(target) = evt.target() {
+                    if let Ok(req) = target.dyn_into::<IdbOpenDbRequest>() {
+                        if let Ok(result) = req.result() {
+                            if let Ok(db) = result.dyn_into::<IdbDatabase>() {
+                                let _ = db.create_object_store(STORE_NAME);
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
         open_req.set_onupgradeneeded(Some(on_upgrade.as_ref().unchecked_ref()));
         on_upgrade.forget();
     }
